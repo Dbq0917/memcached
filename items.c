@@ -116,6 +116,8 @@ void set_cas_id(uint64_t new_cas) {
 
 int item_is_flushed(item *it) {
     rel_time_t oldest_live = settings.oldest_live;
+    if (settings.flush_live_at != 0 && current_time < settings.flush_live_at)
+        return 0; /* delayed flush hasn't activated yet */
     if (it->time <= oldest_live && oldest_live <= current_time)
         return 1;
 
@@ -589,6 +591,8 @@ void item_flush_expired(void) {
     item *iter, *next;
     if (settings.oldest_live == 0)
         return;
+    if (settings.flush_live_at != 0 && current_time < settings.flush_live_at)
+        return; /* delayed flush: items expire lazily once it activates */
     for (i = 0; i < LARGEST_ID; i++) {
         /* The LRU is sorted in decreasing time order, and an item's timestamp
          * is never newer than its last access time, so we only need to walk

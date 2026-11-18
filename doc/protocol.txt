@@ -1819,6 +1819,20 @@ definition of what flush_all does is the following: it causes all
 items whose update time is earlier than the time at which flush_all
 was set to be executed to be ignored for retrieval purposes.
 
+Note that with a delayed flush_all, items stored *during* the delay
+window are also invalidated once the delay elapses, since their update
+time is still earlier than the scheduled execution time. If the server
+is started with the "flush_from_now" extended option
+(-o flush_from_now), a delayed flush_all instead only invalidates
+items that existed at the time the command was received; items stored
+during the delay window are kept. Immediate flushes (no argument, or
+an argument of 0) behave identically in both modes.
+
+Since item timestamps have a granularity of one second, items stored
+in the same second that a delayed flush_all is received are also
+invalidated once the delay elapses. Only items stored in later
+seconds, before the delay elapses, are kept.
+
 The intent of flush_all with a delay, was that in a setting where you
 have a pool of memcached servers, and you need to flush all content,
 you have the option of not resetting all memcached servers at the

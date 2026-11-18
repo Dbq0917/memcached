@@ -263,6 +263,8 @@ static void settings_init(void) {
     settings.shutdown_command = false;
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
     settings.flush_enabled = true;
+    settings.flush_from_now = false;
+    settings.flush_live_at = 0;
     settings.dump_enabled = true;
     settings.crawls_persleep = 1000;
     settings.logger_watcher_buf_size = LOGGER_WATCHER_BUF_SIZE;
@@ -1939,6 +1941,7 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("lru_crawler_tocrawl", "%lu", (unsigned long)settings.lru_crawler_tocrawl);
     APPEND_STAT("tail_repair_time", "%d", settings.tail_repair_time);
     APPEND_STAT("flush_enabled", "%s", settings.flush_enabled ? "yes" : "no");
+    APPEND_STAT("flush_from_now", "%s", settings.flush_from_now ? "yes" : "no");
     APPEND_STAT("dump_enabled", "%s", settings.dump_enabled ? "yes" : "no");
     APPEND_STAT("hash_algorithm", "%s", settings.hash_algorithm);
     APPEND_STAT("lru_maintainer_thread", "%s", settings.lru_maintainer_thread ? "yes" : "no");
@@ -4104,6 +4107,11 @@ static void usage(void) {
            settings.read_buf_mem_limit);
     verify_default("read_buf_mem_limit", settings.read_buf_mem_limit == 0);
     printf("   - no_lru_maintainer:   disable new LRU system + background thread.\n"
+           "   - flush_from_now:      delayed flush_all only invalidates items stored\n"
+           "                          before the command was issued; items stored during\n"
+           "                          the delay window are kept. (default: %s)\n",
+           flag_enabled_disabled(settings.flush_from_now));
+    printf(
            "   - hot_lru_pct:         pct of slab memory to reserve for hot lru.\n"
            "                          (requires lru_maintainer, default pct: %d)\n"
            "   - warm_lru_pct:        pct of slab memory to reserve for warm lru.\n"
@@ -4493,6 +4501,7 @@ static int _mc_meta_save_cb(const char *tag, void *ctx, void *data) {
     // should future proof this with a 64bit upcast, or fetch value from a
     // converter function/macro?
     restart_set_kv(ctx, "oldest_live", "%u", settings.oldest_live);
+    restart_set_kv(ctx, "flush_live_at", "%u", settings.flush_live_at);
     // TODO: use uintptr_t etc? is it portable enough?
     restart_set_kv(ctx, "mmap_oldbase", "%p", meta->mmap_base);
 
@@ -4533,6 +4542,7 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
         R_SLAB_REASSIGN,
         R_CURRENT_CAS,
         R_OLDEST_LIVE,
+        R_FLUSH_LIVE_AT,
         R_LOGGER_GID,
         R_CURRENT_TIME,
         R_STOP_TIME,
@@ -4552,6 +4562,7 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
         [R_SLAB_REASSIGN] = "slab_reassign",
         [R_CURRENT_CAS] = "current_cas",
         [R_OLDEST_LIVE] = "oldest_live",
+        [R_FLUSH_LIVE_AT] = "flush_live_at",
         [R_LOGGER_GID] = "logger_gid",
         [R_CURRENT_TIME] = "current_time",
         [R_STOP_TIME] = "stop_time",
@@ -4647,6 +4658,13 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
                 reuse_mmap = -1;
             } else {
                 settings.oldest_live = val_uint;
+            }
+            break;
+        case R_FLUSH_LIVE_AT:
+            if (!safe_strtoul(val, &val_uint)) {
+                reuse_mmap = -1;
+            } else {
+                settings.flush_live_at = val_uint;
             }
             break;
         case R_LOGGER_GID:
@@ -4786,6 +4804,7 @@ int main (int argc, char **argv) {
         DROP_PRIVILEGES,
         RESP_OBJ_MEM_LIMIT,
         READ_BUF_MEM_LIMIT,
+        FLUSH_FROM_NOW,
 #ifdef TLS
         SSL_CERT,
         SSL_KEY,
@@ -4850,6 +4869,7 @@ int main (int argc, char **argv) {
         [DROP_PRIVILEGES] = "drop_privileges",
         [RESP_OBJ_MEM_LIMIT] = "resp_obj_mem_limit",
         [READ_BUF_MEM_LIMIT] = "read_buf_mem_limit",
+        [FLUSH_FROM_NOW] = "flush_from_now",
 #ifdef TLS
         [SSL_CERT] = "ssl_chain_cert",
         [SSL_KEY] = "ssl_key",
@@ -5600,6 +5620,9 @@ int main (int argc, char **argv) {
                     goto error;
                 }
                 settings.read_buf_mem_limit *= 1024 * 1024; /* megabytes */
+                break;
+            case FLUSH_FROM_NOW:
+                settings.flush_from_now = true;
                 break;
 #ifdef PROXY
             case PROXY_CONFIG:

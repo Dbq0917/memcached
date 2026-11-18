@@ -475,6 +475,7 @@ struct settings {
     char *inter;
     int verbose;
     rel_time_t oldest_live; /* ignore existing items older than this */
+    rel_time_t flush_live_at; /* delayed flush activates at this time (0 = no pending delay) */
     int evict_to_free;
     char *socketpath;   /* path to unix socket if using local socket */
     char *auth_file;    /* path to user authentication file */
@@ -510,6 +511,7 @@ struct settings {
     bool shutdown_command; /* allow shutdown command */
     int tail_repair_time;   /* LRU tail refcount leak repair time */
     bool flush_enabled;     /* flush_all enabled */
+    bool flush_from_now;    /* delayed flush_all cuts off at command time, not at activation */
     bool dump_enabled;      /* whether cachedump/metadump commands work */
     char *hash_algorithm;     /* Hash algorithm in use */
     int lru_crawler_sleep;  /* Microsecond sleep between items */

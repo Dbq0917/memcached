@@ -1284,12 +1284,31 @@ static void process_bin_flush(conn *c, char *extbuf) {
     }
 
     if (exptime > 0) {
-        new_oldest = realtime(exptime) - 1;
+        if (settings.flush_from_now) {
+            /* Cut off at command time: items stored during the delay
+             * survive the flush. The flush activates lazily once
+             * current_time reaches flush_live_at.
+             * Note: items stored in the same second as this command are
+             * also invalidated; timestamps have one second granularity.
+             */
+            new_oldest = current_time;
+            settings.flush_live_at = realtime(exptime) - 1;
+        } else {
+            new_oldest = realtime(exptime) - 1;
+            settings.flush_live_at = 0;
+        }
     } else {
         new_oldest = current_time - 1;
+        settings.flush_live_at = 0;
     }
     settings.oldest_live = new_oldest;
     item_flush_expired();
+
+    LOGGER_LOG(c->thread->l, LOG_SYSEVENTS, LOGGER_FLUSH_ALL, NULL,
+            (int32_t)exptime,
+            settings.flush_from_now ? "from_now" : "legacy",
+            (unsigned int)settings.oldest_live,
+            (unsigned int)settings.flush_live_at);
 
     pthread_mutex_lock(&c->thread->stats.mutex);
     c->thread->stats.flush_cmds++;
