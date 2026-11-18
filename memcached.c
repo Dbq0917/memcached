@@ -94,6 +94,7 @@ static void settings_init(void);
 
 /* event handling, network IO */
 static void event_handler(const evutil_socket_t fd, const short which, void *arg);
+static void _get_timeout_cb(const evutil_socket_t fd, const short which, void *arg);
 static void conn_close(conn *c);
 static void conn_init(void);
 static bool update_event(conn *c, const int new_flags);
@@ -254,6 +255,7 @@ static void settings_init(void) {
     settings.temp_lru = false;
     settings.temporary_ttl = 61;
     settings.idle_timeout = 0; /* disabled */
+    settings.get_timeout_ms = 0; /* disabled */
     settings.hashpower_init = 0;
     settings.slab_reassign = true;
     settings.slab_automove = 1;
@@ -272,6 +274,10 @@ static void settings_init(void) {
     settings.read_buf_mem_limit = 0;
 #ifdef MEMCACHED_DEBUG
     settings.relaxed_privileges = false;
+#ifdef EXTSTORE
+    settings.ext_test_slow_key = NULL;
+    settings.ext_test_slow_ms = 0;
+#endif
 #endif
     settings.num_napi_ids = 0;
     settings.memory_file = NULL;
@@ -534,7 +540,7 @@ static void _conn_event_readd(conn *c) {
 
 /* bring conn back from a sidethread. could have had its event base moved. */
 void conn_worker_readd(conn *c) {
-    assert(c->resps_suspended == 0); // TODO: remove assert.
+    assert(c->resps_suspended == c->resps_zombie);
 
     switch (c->state) {
         case conn_closing:
@@ -718,6 +724,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->close_after_write = false;
     c->last_cmd_time = current_time; /* initialize for idle kicker */
     assert(c->resps_suspended == 0);
+    c->resps_zombie = 0;
+    c->resp_zombies = NULL;
 
     c->item = 0;
     c->ssl = NULL;
@@ -769,6 +777,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
     c->ev_flags = event_flags;
+    evtimer_assign(&c->get_timeout_event, base, _get_timeout_cb, c);
 
     if (event_add(&c->event, 0) == -1) {
         perror("event_add");
@@ -872,6 +881,7 @@ static void conn_close(conn *c) {
 
     /* delete the event, the socket and the conn */
     event_del(&c->event);
+    get_batch_timeout_stop(c);
 
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
@@ -1207,6 +1217,187 @@ mc_resp* resp_finish(conn *c, mc_resp *resp) {
     }
     resp_free(c->thread, resp);
     return next;
+}
+
+static void _log_get_timeout(conn *c, mc_resp *resp) {
+    if (c->thread == NULL || c->thread->l == NULL || resp->iovcnt == 0) {
+        return;
+    }
+
+    const char *buf = resp->iov[0].iov_base;
+    size_t len = resp->iov[0].iov_len;
+    if (buf == NULL || len < 7 || memcmp(buf, "VALUE ", 6) != 0) {
+        return;
+    }
+
+    const char *key = buf + 6;
+    const char *end = memchr(key, ' ', len - 6);
+    if (end == NULL) {
+        return;
+    }
+    size_t nkey = end - key;
+    if (nkey > KEY_MAX_LENGTH) {
+        return;
+    }
+
+    // Reuse the item_get logger with a timeout status so slow keys can be
+    // audited from the standard "watch fetchers" stream.
+    LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL,
+            4, (char *)key, (int)nkey, 0, 0, c->sfd);
+}
+
+void get_batch_timeout_stop(conn *c) {
+    if (event_pending(&c->get_timeout_event, EV_TIMEOUT, NULL)) {
+        event_del(&c->get_timeout_event);
+    }
+}
+
+void get_batch_timeout_suspend(mc_resp *resp) {
+    if (settings.get_timeout_ms == 0) {
+        return;
+    }
+
+    gettimeofday(&resp->get_deadline, NULL);
+    struct timeval tv = {
+        .tv_sec = settings.get_timeout_ms / 1000,
+        .tv_usec = (settings.get_timeout_ms % 1000) * 1000,
+    };
+    timeradd(&resp->get_deadline, &tv, &resp->get_deadline);
+}
+
+static void _get_batch_timeout_arm_earliest(conn *c) {
+    struct timeval now;
+    struct timeval earliest;
+    bool found = false;
+
+    gettimeofday(&now, NULL);
+    for (mc_resp *resp = c->resp_head; resp != NULL; resp = resp->next) {
+        if (!resp->suspended || resp->io_pending == NULL
+                || resp->io_pending->io_queue_type != IO_QUEUE_EXTSTORE
+                || !timerisset(&resp->get_deadline)) {
+            continue;
+        }
+        if (!found || timercmp(&resp->get_deadline, &earliest, <)) {
+            earliest = resp->get_deadline;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        get_batch_timeout_stop(c);
+        return;
+    }
+
+    struct timeval tv;
+    if (timercmp(&earliest, &now, <=)) {
+        timerclear(&tv);
+    } else {
+        timersub(&earliest, &now, &tv);
+    }
+
+    get_batch_timeout_stop(c);
+    if (evtimer_add(&c->get_timeout_event, &tv) == -1) {
+        if (settings.verbose > 1) {
+            perror("get batch timer add");
+        }
+    }
+}
+
+void get_batch_timeout_arm(conn *c) {
+    if (settings.get_timeout_ms > 0) {
+        _get_batch_timeout_arm_earliest(c);
+    }
+}
+
+// Called by the storage IO return path once a timed out response has
+// completed its IO. The response was detached from the client's response
+// chain so the rest of the batch could be written without it.
+void get_batch_timeout_finish(conn *c, mc_resp *resp) {
+    mc_resp **pp = &c->resp_zombies;
+    while (*pp != NULL && *pp != resp) {
+        pp = &(*pp)->next;
+    }
+    if (*pp == NULL) {
+        return;
+    }
+    *pp = resp->next;
+    resp->next = NULL;
+
+    assert(c->resps_zombie > 0);
+    assert(c->resps_suspended > 0);
+    c->resps_zombie--;
+    c->resps_suspended--;
+
+    if (resp->io_pending) {
+        io_pending_t *io = resp->io_pending;
+        resp->io_pending = NULL;
+        io->finalize_cb(io);
+        do_cache_free(c->thread->io_cache, io);
+    }
+    resp_reset(resp);
+    resp_free(c->thread, resp);
+
+    if (c->resps_suspended == c->resps_zombie) {
+        get_batch_timeout_stop(c);
+        conn_worker_readd(c);
+    }
+}
+
+static void _get_timeout_cb(const evutil_socket_t fd, const short which, void *arg) {
+    conn *c = (conn *)arg;
+    if (c->resps_suspended == c->resps_zombie) {
+        get_batch_timeout_stop(c);
+        return;
+    }
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    int timedout = 0;
+    mc_resp *keep_head = NULL;
+    mc_resp *keep_tail = NULL;
+    mc_resp *resp = c->resp_head;
+
+    while (resp != NULL) {
+        mc_resp *next = resp->next;
+        if (resp->suspended && resp->io_pending != NULL
+                && resp->io_pending->io_queue_type == IO_QUEUE_EXTSTORE
+                && timerisset(&resp->get_deadline)
+                && timercmp(&resp->get_deadline, &now, <=)) {
+            _log_get_timeout(c, resp);
+            resp->timedout = true;
+            resp->skip = true;
+            resp->next = c->resp_zombies;
+            c->resp_zombies = resp;
+            c->resps_zombie++;
+            timedout++;
+        } else {
+            if (keep_tail == NULL) {
+                keep_head = resp;
+            } else {
+                keep_tail->next = resp;
+            }
+            keep_tail = resp;
+            resp->next = NULL;
+        }
+        resp = next;
+    }
+
+    c->resp_head = keep_head;
+    c->resp = keep_tail;
+
+    if (timedout > 0) {
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.get_timeout++;
+        c->thread->stats.get_timeout_keys += timedout;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+    }
+
+    if (c->resps_suspended == c->resps_zombie) {
+        get_batch_timeout_stop(c);
+        conn_worker_readd(c);
+    } else {
+        _get_batch_timeout_arm_earliest(c);
+    }
 }
 
 // tells if connection has a depth of response objects to process.
@@ -1812,6 +2003,8 @@ void server_stats(ADD_STAT add_stats, void *c) {
         APPEND_STAT("get_extstore", "%llu", (unsigned long long)thread_stats.get_extstore);
         APPEND_STAT("get_aborted_extstore", "%llu", (unsigned long long)thread_stats.get_aborted_extstore);
         APPEND_STAT("get_oom_extstore", "%llu", (unsigned long long)thread_stats.get_oom_extstore);
+        APPEND_STAT("get_timeout", "%llu", (unsigned long long)thread_stats.get_timeout);
+        APPEND_STAT("get_timeout_keys", "%llu", (unsigned long long)thread_stats.get_timeout_keys);
         APPEND_STAT("recache_from_extstore", "%llu", (unsigned long long)thread_stats.recache_from_extstore);
         APPEND_STAT("miss_from_extstore", "%llu", (unsigned long long)thread_stats.miss_from_extstore);
         APPEND_STAT("badcrc_from_extstore", "%llu", (unsigned long long)thread_stats.badcrc_from_extstore);
@@ -1950,6 +2143,7 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("temp_lru", "%s", settings.temp_lru ? "yes" : "no");
     APPEND_STAT("temporary_ttl", "%u", settings.temporary_ttl);
     APPEND_STAT("idle_timeout", "%d", settings.idle_timeout);
+    APPEND_STAT("get_timeout_ms", "%u", settings.get_timeout_ms);
     APPEND_STAT("watcher_logbuf_size", "%u", settings.logger_watcher_buf_size);
     APPEND_STAT("worker_logbuf_size", "%u", settings.logger_buf_size);
     APPEND_STAT("read_buf_mem_limit", "%u", settings.read_buf_mem_limit);
@@ -3276,7 +3470,7 @@ static void drive_machine(conn *c) {
              * remove the connection from the worker thread and dispatch the
              * IO queue
              */
-            if (c->resps_suspended) {
+            if (c->resps_suspended > c->resps_zombie) {
                 LIBEVENT_THREAD *t = c->thread;
                 // FIXME: carefully check or document somewhere that submit
                 // cannot resume a connection in-line with submission.
@@ -4112,9 +4306,11 @@ static void usage(void) {
            "   - warm_max_factor:     items idle > cold lru age * this drop from warm. (default: %.2f)\n"
            "   - temporary_ttl:       TTL's below get separate LRU, can't be evicted.\n"
            "                          (requires lru_maintainer, default: %d)\n"
-           "   - idle_timeout:        timeout for idle connections. (default: %d, no timeout)\n",
+           "   - idle_timeout:        timeout for idle connections. (default: %d, no timeout)\n"
+           "   - get_timeout_ms:      deadline for a multiget batch in milliseconds.\n"
+           "                          timed out keys are omitted and logged. (default: %u, disabled)\n",
            settings.hot_lru_pct, settings.warm_lru_pct, settings.hot_max_factor, settings.warm_max_factor,
-           settings.temporary_ttl, settings.idle_timeout);
+           settings.temporary_ttl, settings.idle_timeout, settings.get_timeout_ms);
     printf("   - slab_chunk_max:      (EXPERIMENTAL) maximum slab size in kilobytes. use extreme care. (default: %d)\n"
            "   - watcher_logbuf_size: size in kilobytes of per-watcher write buffer. (default: %u)\n"
            "   - worker_logbuf_size:  size in kilobytes of per-worker-thread buffer\n"
@@ -4767,6 +4963,7 @@ int main (int argc, char **argv) {
         WARM_MAX_FACTOR,
         TEMPORARY_TTL,
         IDLE_TIMEOUT,
+        GET_TIMEOUT_MS,
         WATCHER_LOGBUF_SIZE,
         WORKER_LOGBUF_SIZE,
         SLAB_SIZES,
@@ -4831,6 +5028,7 @@ int main (int argc, char **argv) {
         [WARM_MAX_FACTOR] = "warm_max_factor",
         [TEMPORARY_TTL] = "temporary_ttl",
         [IDLE_TIMEOUT] = "idle_timeout",
+        [GET_TIMEOUT_MS] = "get_timeout_ms",
         [WATCHER_LOGBUF_SIZE] = "watcher_logbuf_size",
         [WORKER_LOGBUF_SIZE] = "worker_logbuf_size",
         [SLAB_SIZES] = "slab_sizes",
@@ -5402,6 +5600,16 @@ int main (int argc, char **argv) {
                     goto error;
                 }
                 settings.idle_timeout = atoi(subopts_value);
+                break;
+            case GET_TIMEOUT_MS:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing numeric argument for get_timeout_ms\n");
+                    goto error;
+                }
+                if (!safe_strtoul(subopts_value, &settings.get_timeout_ms)) {
+                    fprintf(stderr, "could not parse argument to get_timeout_ms\n");
+                    goto error;
+                }
                 break;
             case WATCHER_LOGBUF_SIZE:
                 if (subopts_value == NULL) {

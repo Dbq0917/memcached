@@ -51,6 +51,9 @@ typedef struct _io_pending_storage_t {
 static pthread_t storage_compact_tid;
 static pthread_mutex_t storage_compact_plock;
 static pthread_cond_t storage_compact_cond;
+#ifdef MEMCACHED_DEBUG
+static int ext_test_slow_once = 0;
+#endif
 
 // Only call this if item has ITEM_HDR
 bool storage_validate_item(void *e, item *it) {
@@ -151,6 +154,21 @@ static void _storage_get_item_cb(void *e, obj_io *io, int ret) {
     assert(p->active == true);
     item *read_it = (item *)io->buf;
     bool miss = false;
+
+#ifdef MEMCACHED_DEBUG
+    // Test hook: deterministically make one key look like a slow disk read.
+    // This runs on the storage IO thread, so it does not stall the worker.
+    if (settings.ext_test_slow_key != NULL && settings.ext_test_slow_ms > 0
+            && p->hdr_it != NULL) {
+        const char *key = ITEM_key(p->hdr_it);
+        size_t nkey = p->hdr_it->nkey;
+        size_t slow_nkey = strlen(settings.ext_test_slow_key);
+        if (nkey == slow_nkey && memcmp(key, settings.ext_test_slow_key, nkey) == 0
+                && __atomic_exchange_n(&ext_test_slow_once, 1, __ATOMIC_RELAXED) == 0) {
+            usleep(settings.ext_test_slow_ms * 1000);
+        }
+    }
+#endif
 
     // TODO: How to do counters for hit/misses?
     if (ret < 1) {
@@ -380,19 +398,17 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp) {
 }
 
 void storage_submit_cb(io_queue_t *q) {
-    // TODO: until we decide to port extstore's internal code to use
-    // io_pending objs we "port" the IOP's into an obj_io chain just before
-    // submission here.
-    void *eio_head = NULL;
+    // Submit each read independently. extstore picks the least busy IO
+    // thread per submission, so one slow object can't hold up unrelated
+    // keys from the same multiget behind it in a single worker queue.
     while(!STAILQ_EMPTY(&q->stack)) {
         io_pending_t *p = STAILQ_FIRST(&q->stack);
         STAILQ_REMOVE_HEAD(&q->stack, iop_next);
         // FIXME: re-evaluate this.
         obj_io *io_ctx = (obj_io *) ((char *)p + p->payload);
-        io_ctx->next = eio_head;
-        eio_head = io_ctx;
+        io_ctx->next = NULL;
+        extstore_submit(q->ctx, io_ctx);
     }
-    extstore_submit(q->ctx, eio_head);
 }
 
 // Runs locally in worker thread.
@@ -476,7 +492,11 @@ static void recache_or_free(io_pending_t *pending) {
 
 // Called after an IO has been returned to the worker thread.
 static void storage_return_cb(io_pending_t *pending) {
-    conn_resp_unsuspend(pending->c, pending->resp);
+    if (pending->resp->timedout) {
+        get_batch_timeout_finish(pending->c, pending->resp);
+    } else {
+        conn_resp_unsuspend(pending->c, pending->resp);
+    }
 }
 
 // Called after responses have been transmitted. Need to free up related data.
@@ -1365,6 +1385,10 @@ int storage_read_config(void *conf, char **subopt) {
         EXT_MAX_FRAG,
         EXT_DROP_UNREAD,
         SLAB_AUTOMOVE_FREERATIO, // FIXME: move this back?
+#ifdef MEMCACHED_DEBUG
+        EXT_TEST_SLOW_KEY,
+        EXT_TEST_SLOW_MS,
+#endif
     };
 
     char *const subopts_tokens[] = {
@@ -1383,6 +1407,10 @@ int storage_read_config(void *conf, char **subopt) {
         [EXT_MAX_FRAG] = "ext_max_frag",
         [EXT_DROP_UNREAD] = "ext_drop_unread",
         [SLAB_AUTOMOVE_FREERATIO] = "slab_automove_freeratio",
+#ifdef MEMCACHED_DEBUG
+        [EXT_TEST_SLOW_KEY] = "ext_test_slow_key",
+        [EXT_TEST_SLOW_MS] = "ext_test_slow_ms",
+#endif
         NULL
     };
 
@@ -1510,6 +1538,27 @@ int storage_read_config(void *conf, char **subopt) {
                 return 1;
             }
             break;
+#ifdef MEMCACHED_DEBUG
+        case EXT_TEST_SLOW_KEY:
+            if (subopts_value == NULL) {
+                fprintf(stderr, "Missing ext_test_slow_key argument\n");
+                return 1;
+            }
+            free(settings.ext_test_slow_key);
+            settings.ext_test_slow_key = strdup(subopts_value);
+            ext_test_slow_once = 0;
+            break;
+        case EXT_TEST_SLOW_MS:
+            if (subopts_value == NULL) {
+                fprintf(stderr, "Missing ext_test_slow_ms argument\n");
+                return 1;
+            }
+            if (!safe_strtoul(subopts_value, &settings.ext_test_slow_ms)) {
+                fprintf(stderr, "could not parse argument to ext_test_slow_ms\n");
+                return 1;
+            }
+            break;
+#endif
         case SLAB_AUTOMOVE_FREERATIO:
             if (subopts_value == NULL) {
                 fprintf(stderr, "Missing slab_automove_freeratio argument\n");

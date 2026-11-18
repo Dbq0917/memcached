@@ -338,6 +338,8 @@ struct slab_stats {
 #define THREAD_STATS_FIELDS \
     X(get_cmds) \
     X(get_misses) \
+    X(get_timeout) \
+    X(get_timeout_keys) \
     X(get_expired) \
     X(get_flushed) \
     X(touch_cmds) \
@@ -522,6 +524,7 @@ struct settings {
     bool temp_lru; /* TTL < temporary_ttl uses TEMP_LRU */
     uint32_t temporary_ttl; /* temporary LRU threshold */
     int idle_timeout;       /* Number of seconds to let connections idle */
+    unsigned int get_timeout_ms; /* batch get deadline in milliseconds, 0 disables */
     unsigned int logger_watcher_buf_size; /* size of logger's per-watcher buffer */
     unsigned int logger_buf_size; /* size of per-thread logger buffer */
     unsigned int read_buf_mem_limit; /* total megabytes allowable for net buffers */
@@ -544,6 +547,10 @@ struct settings {
     bool ext_drop_unread; /* skip unread items during compaction */
     /* start flushing to extstore after memory below this */
     unsigned int ext_global_pool_min;
+#ifdef MEMCACHED_DEBUG
+    char *ext_test_slow_key; /* test hook: delay reads for this key */
+    unsigned int ext_test_slow_ms; /* test hook: delay length in milliseconds */
+#endif
 #endif
 #ifdef TLS
     void *ssl_ctx; /* holds the SSL server context which has the server certificate */
@@ -803,6 +810,8 @@ typedef struct _mc_resp {
      */
     bool skip;
     bool suspended; // waiting for response from subsystem
+    bool timedout; // skipped by a batch get deadline; IO still owns us
+    struct timeval get_deadline; // absolute deadline for this response
     bool free; // double free detection.
     bool noreply; // TODO: remove if we can rely on skip-only
     bool binary_prot; // let main ascii prot know if we're binary or not
@@ -891,6 +900,9 @@ struct conn {
     int    sbytes;    /* how many bytes to swallow */
 
     int resps_suspended; /* see notes on io_queue_cb_t */
+    int resps_zombie; /* timed out responses still waiting on IO completion */
+    mc_resp *resp_zombies; /* detached timed out responses */
+    struct event get_timeout_event; /* batch get deadline timer */
 #ifdef PROXY
     void *proxy_rctx; /* pointer to active request context */
 #endif
@@ -971,10 +983,16 @@ void conn_io_queue_return(io_pending_t *io);
         resp->suspended = false; \
         c->resps_suspended--; \
         assert(c->resps_suspended >= 0); \
-        if (c->resps_suspended == 0) { \
+        if (c->resps_suspended == c->resps_zombie) { \
+            get_batch_timeout_stop(c); \
             conn_worker_readd(c); \
         } \
     } while (0)
+
+void get_batch_timeout_suspend(mc_resp *resp);
+void get_batch_timeout_arm(conn *c);
+void get_batch_timeout_stop(conn *c);
+void get_batch_timeout_finish(conn *c, mc_resp *resp);
 
 conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size,
     enum network_transport transport, struct event_base *base, void *ssl, uint64_t conntag, enum protocol bproto);

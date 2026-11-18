@@ -457,6 +457,7 @@ static void process_get_command(conn *c, LIBEVENT_THREAD *t, mcp_parser_t *pr, p
         if (resp->io_pending) {
             resp->io_pending->c = c;
             conn_resp_suspend(c, resp);
+            get_batch_timeout_suspend(resp);
         }
         curkey += klen;
         klen = 0;
@@ -483,6 +484,18 @@ static void process_get_command(conn *c, LIBEVENT_THREAD *t, mcp_parser_t *pr, p
     if (settings.verbose > 1)
         fprintf(stderr, ">%d END\n", t->cur_sfd);
 
+    // Keep END in its own response object when deadlines are enabled. If the
+    // final key times out we must be able to skip that key without also
+    // dropping the batch terminator.
+    if (c->resps_suspended > c->resps_zombie) {
+        if (settings.get_timeout_ms > 0 && !resp_start(c)) {
+            process_get_command_err(c, "SERVER_ERROR out of memory writing get response");
+            return;
+        }
+        if (settings.get_timeout_ms > 0) {
+            get_batch_timeout_arm(c);
+        }
+    }
     resp_add_iov(c->resp, "END\r\n", 5);
     conn_set_state(c, conn_new_cmd);
     return;

@@ -326,6 +326,14 @@ hold items with such keys (because they were never stored, or stored
 but deleted to make space for more items, or expired, or explicitly
 deleted by a client).
 
+If the server is started with `-o get_timeout_ms=<milliseconds>`, a
+multi-key retrieval command has a deadline for asynchronous item fetches.
+Items not ready at the deadline are omitted and the response ends normally
+with "END\r\n". The missing keys are the retry set; clients should retry only
+those keys instead of the whole batch. Timed out keys are logged via
+`watch fetchers` with `status=timeout`, and counted in
+`get_timeout`/`get_timeout_keys` in `stats`. See doc/get-timeout.md.
+
 
 Deletion
 --------

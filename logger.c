@@ -88,7 +88,7 @@ static void _logger_log_ext_write(logentry *e, const entry_details *d, const voi
     e->size = sizeof(struct logentry_ext_write) + le->nkey;
 }
 #endif
-// 0 == nf, 1 == found. 2 == flushed. 3 == expired.
+// 0 == nf, 1 == found. 2 == flushed. 3 == expired. 4 == timed out.
 // might be useful to store/print the flags an item has?
 // could also collapse this and above code into an "item status" struct. wait
 // for more endpoints to be written before making it generic, though.
@@ -236,7 +236,7 @@ static int _logger_parse_ige(logentry *e, char *scratch) {
     struct logentry_item_get *le = (struct logentry_item_get *) e->data;
     char keybuf[KEY_MAX_URI_ENCODED_LENGTH];
     const char * const was_found_map[] = {
-        "not_found", "found", "flushed", "expired" };
+        "not_found", "found", "flushed", "expired", "timeout" };
 
     uriencode(le->key, keybuf, le->nkey, KEY_MAX_URI_ENCODED_LENGTH);
     total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
