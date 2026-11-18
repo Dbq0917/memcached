@@ -574,6 +574,8 @@ static void process_stat(conn *c, mcp_parser_t *pr) {
         return;
     } else if (strncmp(subcommand, "conns", len) == 0) {
         process_stats_conns(&append_stats, c);
+    } else if (strncmp(subcommand, "counters", len) == 0) {
+        process_stats_counters(&append_stats, c);
 #ifdef EXTSTORE
     } else if (strncmp(subcommand, "extstore", len) == 0) {
         process_extstore_stats(&append_stats, c);

@@ -26,6 +26,7 @@
 #include "stats_prefix.h"
 #include "util.h"
 #include "protocol_binary.h"
+#include "counter.h"
 #ifdef TLS
 #include <openssl/ssl.h>
 #endif
@@ -2250,6 +2251,170 @@ static enum test_return test_issue_101(void) {
     return ret;
 }
 
+/* Drive a counter past its declared limit and assert it saturates instead of
+ * wrapping, for every supported width. This directly reproduces the original
+ * single-byte wrap defect at u8/u16/u32 scale. */
+static enum test_return test_counter_saturation(void) {
+    static const struct {
+        mc_width_t width;
+        uint64_t limit;
+    } cases[] = {
+        { MC_WIDTH_U8,  UINT8_MAX },
+        { MC_WIDTH_U16, UINT16_MAX },
+        { MC_WIDTH_U32, UINT32_MAX },
+        { MC_WIDTH_U64, UINT64_MAX },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        mc_counter_t ctr;
+        mc_counter_init(&ctr, "sat", cases[i].width);
+        assert(mc_counter_limit(&ctr) == cases[i].limit);
+
+        /* Explicitly cross the upper boundary: limit - 10, then +25. */
+        assert(mc_counter_add(&ctr, cases[i].limit - 10) == false);
+        assert(mc_counter_value(&ctr) == cases[i].limit - 10);
+        assert(mc_counter_add(&ctr, 25) == true);
+
+        /* Value must be the exact limit, never wrapped to a small number. */
+        assert(mc_counter_value(&ctr) == cases[i].limit);
+        assert(mc_counter_overflowed(&ctr) == true);
+        assert(mc_counter_overflow_events(&ctr) == 1);
+
+        /* Further increments stay clamped and keep counting events. */
+        assert(mc_counter_add(&ctr, 1) == true);
+        assert(mc_counter_value(&ctr) == cases[i].limit);
+        assert(mc_counter_overflow_events(&ctr) == 2);
+    }
+
+    /* u8 regression: a raw uint8_t would wrap 255 + 1 -> 0. */
+    mc_counter_t byte_ctr;
+    mc_counter_init(&byte_ctr, "byte", MC_WIDTH_U8);
+    mc_counter_add(&byte_ctr, UINT8_MAX);
+    assert(mc_counter_add(&byte_ctr, 1) == true);
+    assert(mc_counter_value(&byte_ctr) == UINT8_MAX);
+    assert(mc_counter_value(&byte_ctr) != 0);
+
+    return TEST_PASS;
+}
+
+/* A narrow, externally owned counter that wraps must be detected via
+ * mc_counter_observe(), while the stored value stays monotonic. */
+static enum test_return test_counter_observe_wrap(void) {
+    mc_counter_t ctr;
+    mc_counter_init(&ctr, "observed", MC_WIDTH_U8);
+
+    assert(mc_counter_observe(&ctr, 250) == false);
+    assert(mc_counter_value(&ctr) == 250);
+    /* Simulate the uint8_t source wrapping 255 -> 7 on the next tick. */
+    assert(mc_counter_observe(&ctr, 7) == true);
+    assert(mc_counter_overflowed(&ctr) == true);
+    assert(mc_counter_overflow_events(&ctr) == 1);
+    /* The safe view never moves backwards. */
+    assert(mc_counter_value(&ctr) == 250);
+    assert(mc_counter_observe(&ctr, 251) == false);
+    assert(mc_counter_value(&ctr) == 251);
+
+    return TEST_PASS;
+}
+
+/* Time-windowed growth rate and time-to-limit prediction, with deterministic
+ * clocks. Numeric expectations are asserted exactly so the record is
+ * reviewable. */
+static enum test_return test_counter_window_eta(void) {
+    mc_counter_t ctr;
+    struct mc_counter_sample s;
+
+    mc_counter_init(&ctr, "window", MC_WIDTH_U32);
+
+    /* Baseline sample: no prior window, rate is zero and ETA is unknown. */
+    mc_counter_sample(&ctr, 1000, &s);
+    assert(s.value == 0);
+    assert(s.window_delta == 0);
+    assert(s.rate_per_sec == 0);
+    assert(s.eta_seconds == UINT64_MAX);
+
+    /* 10 000 increments over 100 s -> 100/s. */
+    mc_counter_add(&ctr, 10000);
+    mc_counter_sample(&ctr, 1100, &s);
+    assert(s.window_delta == 10000);
+    assert(s.window_seconds == 100);
+    assert(s.rate_per_sec == 100);
+    assert(s.value == 10000);
+    assert(s.headroom == UINT32_MAX - 10000);
+    /* ETA = ceil(headroom / 100). */
+    assert(s.eta_seconds == (s.headroom + 99) / 100);
+
+    /* A zero-growth window makes the ETA unknown again, not negative. */
+    mc_counter_sample(&ctr, 1200, &s);
+    assert(s.window_delta == 0);
+    assert(s.rate_per_sec == 0);
+    assert(s.eta_seconds == UINT64_MAX);
+
+    /* Saturated counter: headroom zero, ETA reports unknown (already full). */
+    mc_counter_t full;
+    mc_counter_init(&full, "full", MC_WIDTH_U8);
+    mc_counter_add(&full, UINT8_MAX);
+    mc_counter_sample(&full, 1300, &s);
+    assert(s.headroom == 0);
+    assert(s.eta_seconds == UINT64_MAX);
+
+    return TEST_PASS;
+}
+
+/* Hit rate must never go negative even when an underlying narrow counter
+ * wraps. The wrap-safe delta clamps non-monotonic differences to zero. */
+static enum test_return test_counter_hit_rate_sign(void) {
+    /* Raw u8 view: hits wrapped 255 -> 3 while lookups kept growing. */
+    uint8_t hits_before = 255, hits_after = 3;
+    uint64_t lookups_before = 255, lookups_after = 300;
+
+    uint64_t hit_delta = mc_counter_delta(hits_before, hits_after);
+    uint64_t lookup_delta = mc_counter_delta(lookups_before, lookups_after);
+    assert(hit_delta == 0);              /* clamped, not -252 */
+    assert(lookup_delta == 45);
+
+    /* Ratio built from the deltas is non-negative and bounded by 1.0. */
+    double hit_rate = lookup_delta == 0 ? 0.0
+                                        : (double)hit_delta / (double)lookup_delta;
+    assert(hit_rate >= 0.0 && hit_rate <= 1.0);
+
+    /* Healthy, non-wrapped samples produce a normal positive delta. */
+    assert(mc_counter_delta(100, 180) == 80);
+
+    return TEST_PASS;
+}
+
+/* Registry used by the "stats counters" command: registration, duplicate
+ * rejection and ordered snapshots. */
+static enum test_return test_counter_registry(void) {
+    mc_registry_init();
+    assert(mc_registry_count() == 0);
+
+    mc_counter_t *a = mc_registry_register("alpha", MC_WIDTH_U8);
+    mc_counter_t *b = mc_registry_register("beta", MC_WIDTH_U16);
+    assert(a != NULL && b != NULL);
+    assert(mc_registry_register("alpha", MC_WIDTH_U32) == NULL);
+    assert(mc_registry_register("", MC_WIDTH_U8) == NULL);
+    assert(mc_registry_count() == 2);
+    assert(mc_registry_find("alpha") == a);
+    assert(mc_registry_find("missing") == NULL);
+
+    mc_counter_add(a, 200);
+    mc_counter_add(b, 1000);
+
+    struct mc_counter_sample samples[MC_COUNTER_REGISTRY_MAX];
+    size_t n = mc_registry_snapshot(samples, MC_COUNTER_REGISTRY_MAX, 5000);
+    assert(n == 2);
+    assert(strcmp(samples[0].name, "alpha") == 0);
+    assert(samples[0].value == 200);
+    assert(samples[0].limit == UINT8_MAX);
+    assert(strcmp(samples[1].name, "beta") == 0);
+    assert(samples[1].value == 1000);
+    assert(samples[1].limit == UINT16_MAX);
+
+    return TEST_PASS;
+}
+
 typedef enum test_return (*TEST_FUNC)(void);
 struct testcase {
     const char *description;
@@ -2275,6 +2440,11 @@ struct testcase testcases[] = {
     { "vperror", test_vperror },
     { "issue_101", test_issue_101 },
     { "crc32c", test_crc32c },
+    { "counter_saturation", test_counter_saturation },
+    { "counter_observe_wrap", test_counter_observe_wrap },
+    { "counter_window_eta", test_counter_window_eta },
+    { "counter_hit_rate_sign", test_counter_hit_rate_sign },
+    { "counter_registry", test_counter_registry },
     /* The following tests all run towards the same server */
     { "start_server", start_memcached_server },
     { "issue_92", test_issue_92 },

@@ -1090,6 +1090,7 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c);
 void stats_reset(void);
 void process_stat_settings(ADD_STAT add_stats, void *c);
 void process_stats_conns(ADD_STAT add_stats, void *c);
+void process_stats_counters(ADD_STAT add_stats, void *c);
 
 #if HAVE_DROP_PRIVILEGES
 extern void setup_privilege_violations_handler(void);

@@ -1,0 +1,47 @@
+# e2e stats counters record
+# date: 2026-11-18T16:55:46Z
+# sha: 8c8875b2926456dbb79aea0acf63cca13ee9b779
+== 1. field semantics unchanged: cmd counters match classic stats ==
+cmd_get counters==stats (70 vs 70)                   PASS
+cmd_set counters==stats (50 vs 50)                   PASS
+get_hits counters==stats (50 vs 50)                  PASS
+get_misses counters==stats (20 vs 20)                PASS
+expected workload counts cmd_get=70                  PASS
+expected workload counts cmd_set=50                  PASS
+expected workload counts get_hits=50                 PASS
+expected workload counts get_misses=20               PASS
+
+== 2. byte counters are monotonic and only grow by the stats query ==
+bytes_read counters <= stats (query overhead)        PASS
+bytes_written counters <= stats (query overhead)     PASS
+bytes_read grew during workload                      PASS
+bytes_written grew during workload                   PASS
+
+== 3. no overflow/saturation under normal traffic ==
+cmd_get overflow_events == 0                         PASS
+cmd_set overflow_events == 0                         PASS
+get_hits overflow_events == 0                        PASS
+get_misses overflow_events == 0                      PASS
+bytes_read overflow_events == 0                      PASS
+bytes_written overflow_events == 0                   PASS
+
+== 4. time-window growth rate (window ~1s) ==
+cmd_get window_delta == 70                           PASS
+cmd_set window_delta == 50                           PASS
+get_misses window_delta == 20                        PASS
+cmd_get rate_per_sec == 70                           PASS
+cmd_get window_seconds >= 1                          PASS
+cmd_get eta_seconds is numeric (not unknown)         PASS
+cmd_set eta_seconds is numeric (not unknown)         PASS
+get_hits eta_seconds is numeric (not unknown)        PASS
+get_misses eta_seconds is numeric (not unknown)      PASS
+bytes_read eta_seconds is numeric (not unknown)      PASS
+bytes_written eta_seconds is numeric (not unknown)   PASS
+
+== 5. existing stats reset command still works ==
+stats reset returns RESET                            PASS
+cmd_get reset to 0                                   PASS
+counters view reset too (cmd_get:value == 0)         PASS
+counters overflow_events cleared on reset            PASS
+
+RESULT: ALL PASS (0 failures)

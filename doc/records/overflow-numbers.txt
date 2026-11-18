@@ -1,0 +1,4 @@
+u8   limit=255                  raw(limit+1)=0                    safe_value=255                  overflow_event=1
+u16  limit=65535                raw(limit+1)=0                    safe_value=65535                overflow_event=1
+u32  limit=4294967295           raw(limit+1)=0                    safe_value=4294967295           overflow_event=1
+u64  limit=18446744073709551615 safe(limit-10 +25)=18446744073709551615 overflow_event=1

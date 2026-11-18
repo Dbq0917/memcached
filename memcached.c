@@ -56,6 +56,7 @@
 #include "proto_text.h"
 #include "proto_bin.h"
 #include "proto_proxy.h"
+#include "counter.h"
 
 #if defined(__FreeBSD__)
 #include <sys/sysctl.h>
@@ -69,6 +70,7 @@ static int new_socket(struct addrinfo *ai);
 static ssize_t tcp_read(conn *arg, void *buf, size_t count);
 static ssize_t tcp_sendmsg(conn *arg, struct msghdr *msg, int flags);
 static ssize_t tcp_write(conn *arg, void *buf, size_t count);
+void counters_registry_setup(void);
 
 enum try_read_result {
     READ_DATA_RECEIVED,
@@ -202,6 +204,22 @@ static void stats_init(void) {
        values are now false in boolean context... */
     process_started = time(0) - ITEM_UPDATE_INTERVAL - 2;
     stats_prefix_init(settings.prefix_delimiter);
+
+    counters_registry_setup();
+}
+
+/* Register the counters exposed by "stats counters". The declared width
+ * documents the expected traffic magnitude; live values are uint64_t in all
+ * cases so they cannot wrap. Re-calling this (from stats reset) rebuilds a
+ * clean table aligned with the reset of the other statistics. */
+void counters_registry_setup(void) {
+    mc_registry_init();
+    mc_registry_register("cmd_get", MC_WIDTH_U64);
+    mc_registry_register("cmd_set", MC_WIDTH_U64);
+    mc_registry_register("get_hits", MC_WIDTH_U64);
+    mc_registry_register("get_misses", MC_WIDTH_U64);
+    mc_registry_register("bytes_read", MC_WIDTH_U64);
+    mc_registry_register("bytes_written", MC_WIDTH_U64);
 }
 
 void stats_reset(void) {
@@ -211,6 +229,7 @@ void stats_reset(void) {
     STATS_UNLOCK();
     threadlocal_stats_reset();
     item_stats_reset();
+    counters_registry_setup();
 }
 
 static void settings_init(void) {
@@ -1895,6 +1914,73 @@ void server_stats(ADD_STAT add_stats, void *c) {
 #endif
     APPEND_STAT("unexpected_napi_ids", "%llu", (unsigned long long)stats.unexpected_napi_ids);
     APPEND_STAT("round_robin_fallback", "%llu", (unsigned long long)stats.round_robin_fallback);
+}
+
+/* Refresh the safe-counter registry from the same sources used by
+ * server_stats(), then emit per-counter saturation / growth-window data.
+ * Existing "stats" fields are untouched; this only feeds "stats counters". */
+void process_stats_counters(ADD_STAT add_stats, void *c) {
+    struct thread_stats thread_stats;
+    struct slab_stats slab_stats;
+    struct mc_counter_sample samples[MC_COUNTER_REGISTRY_MAX];
+
+    threadlocal_stats_aggregate(&thread_stats);
+    slab_stats_aggregate(&thread_stats, &slab_stats);
+
+    mc_counter_observe(mc_registry_find("cmd_get"), thread_stats.get_cmds);
+    mc_counter_observe(mc_registry_find("cmd_set"), slab_stats.set_cmds);
+    mc_counter_observe(mc_registry_find("get_hits"), slab_stats.get_hits);
+    mc_counter_observe(mc_registry_find("get_misses"), thread_stats.get_misses);
+    mc_counter_observe(mc_registry_find("bytes_read"), thread_stats.bytes_read);
+    mc_counter_observe(mc_registry_find("bytes_written"), thread_stats.bytes_written);
+
+    size_t count = mc_registry_snapshot(samples, MC_COUNTER_REGISTRY_MAX, time(NULL));
+    for (size_t i = 0; i < count; i++) {
+        struct mc_counter_sample *s = &samples[i];
+        /* name is at most MC_COUNTER_NAME_MAX - 1 chars and the longest
+         * suffix is ":overflow_events" (16); build the key with bounded
+         * copies so no truncation is possible. */
+        char key[MC_COUNTER_NAME_MAX + 20];
+        size_t name_len = strnlen(s->name, MC_COUNTER_NAME_MAX - 1);
+        const char *eta = s->eta_seconds == UINT64_MAX
+                        ? "unknown" : NULL;
+
+#define COUNTER_KEY(suffix) do {                                         \
+            size_t suf_len = sizeof(suffix) - 1;                        \
+            memcpy(key, s->name, name_len);                             \
+            memcpy(key + name_len, suffix, suf_len);                    \
+            key[name_len + suf_len] = '\0';                            \
+        } while (0)
+
+        COUNTER_KEY(":width");
+        append_stat(key, add_stats, c, "%s", mc_width_name(s->width));
+        COUNTER_KEY(":value");
+        append_stat(key, add_stats, c, "%llu", (unsigned long long)s->value);
+        COUNTER_KEY(":limit");
+        append_stat(key, add_stats, c, "%llu", (unsigned long long)s->limit);
+        COUNTER_KEY(":headroom");
+        append_stat(key, add_stats, c, "%llu", (unsigned long long)s->headroom);
+        COUNTER_KEY(":overflow_events");
+        append_stat(key, add_stats, c, "%llu",
+                    (unsigned long long)s->overflow_events);
+        COUNTER_KEY(":window_delta");
+        append_stat(key, add_stats, c, "%llu",
+                    (unsigned long long)s->window_delta);
+        COUNTER_KEY(":window_seconds");
+        append_stat(key, add_stats, c, "%llu",
+                    (unsigned long long)s->window_seconds);
+        COUNTER_KEY(":rate_per_sec");
+        append_stat(key, add_stats, c, "%llu",
+                    (unsigned long long)s->rate_per_sec);
+        COUNTER_KEY(":eta_seconds");
+        if (eta != NULL) {
+            append_stat(key, add_stats, c, "%s", eta);
+        } else {
+            append_stat(key, add_stats, c, "%llu",
+                        (unsigned long long)s->eta_seconds);
+        }
+#undef COUNTER_KEY
+    }
 }
 
 void process_stat_settings(ADD_STAT add_stats, void *c) {

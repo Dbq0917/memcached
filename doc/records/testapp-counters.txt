@@ -1,0 +1,6 @@
+1..61
+ok 19 - counter_saturation
+ok 20 - counter_observe_wrap
+ok 21 - counter_window_eta
+ok 22 - counter_hit_rate_sign
+ok 23 - counter_registry

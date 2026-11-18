@@ -1,0 +1,21 @@
+# raw 'stats counters' protocol sample
+STAT cmd_get:width u64
+STAT cmd_get:value 1
+STAT cmd_get:limit 18446744073709551615
+STAT cmd_get:headroom 18446744073709551614
+STAT cmd_get:overflow_events 0
+STAT cmd_get:window_delta 1
+STAT cmd_get:window_seconds 0
+STAT cmd_get:rate_per_sec 0
+STAT cmd_get:eta_seconds unknown
+STAT cmd_set:width u64
+STAT cmd_set:value 1
+STAT cmd_set:limit 18446744073709551615
+STAT cmd_set:headroom 18446744073709551614
+STAT cmd_set:overflow_events 0
+STAT cmd_set:window_delta 1
+STAT cmd_set:window_seconds 0
+STAT cmd_set:rate_per_sec 0
+STAT cmd_set:eta_seconds unknown
+STAT get_hits:width u64
+STAT get_hits:value 1
